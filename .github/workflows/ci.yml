@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Check formatting, lint, types, and tests
+        run: make check
+      - name: Build distributions
+        run: uv build
+      - name: Verify packaged data files
+        run: |
+          uv run python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheels = sorted(Path("dist").glob("*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"Expected exactly one wheel, found: {wheels}")
+          with ZipFile(wheels[0]) as wheel:
+              names = set(wheel.namelist())
+          required = {
+              "citizen_agent/fixtures/default.json",
+              "citizen_agent/domain/schema.sql",
+          }
+          missing = required - names
+          if missing:
+              raise SystemExit(f"Wheel is missing packaged data: {sorted(missing)}")
+          print("Wheel contains citizen_agent/fixtures/default.json and schema.sql")
+          PY
