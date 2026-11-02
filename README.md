@@ -1,121 +1,179 @@
 # Citizen Service Workflow Agent
 
-A deterministic domain backend and Model Context Protocol (MCP) server for **Civitas**, a fictional
-city. The service models everyday municipal workflows — identity verification, parking permits,
-birth certificate copies, bulk waste pickups, address changes, street issue reports, office
-appointments, and human escalation — on top of a seeded SQLite database. Every tool is
-idempotent by design: the same calls against the same seeded database produce the same results
-and the same database contents. No language-model or agent code lives in this phase; later
-phases build an agent, evaluation harness, and web service on top of these tools.
+[![CI](https://github.com/lamebrowndev/citizen-service-workflow-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/lamebrowndev/citizen-service-workflow-agent/actions/workflows/ci.yml)
 
-**Status: Phase 1 — domain backend + MCP server**
+**An AI agent for municipal citizen services, built on a deterministic backend so its reliability can be measured instead of asserted.**
 
-> **Disclaimer:** Civitas is a fictional city. All names, addresses, vehicles, and records in this
-> repository are synthetic. This project is not affiliated with any government or public agency.
+A citizen writes: *"I just moved. Can I get a parking permit for my car?"* Behind that sentence is a workflow with rules and money attached: verify identity, check eligibility, quote the fee, take payment, submit the application. An AI agent can run that workflow, but only if it calls the right tools, in the right order, with the right arguments, and never charges anyone twice.
+
+This repository builds that system in five phases. **Phase 1 is complete:** a deterministic backend for the fictional city of **Civitas**, exposed as a **Model Context Protocol (MCP) server with 17 tools**. Later phases add the agent, an evaluation harness, a single-agent versus multi-agent comparison, and an HTTP API.
+
+> **Status:** Phase 1 of 5 complete. No agent performance numbers appear here yet, because none have been measured yet.
+
+> **Disclaimer:** Civitas is a fictional city. All people, addresses, vehicles, and records are synthetic. This project is not affiliated with any government or public agency.
+
+## Contents
+
+- [Why this project exists](#why-this-project-exists)
+- [What is built so far](#what-is-built-so-far)
+- [Architecture](#architecture)
+- [Quickstart](#quickstart)
+- [Try it in two minutes](#try-it-in-two-minutes)
+- [The 17 tools](#the-17-tools)
+- [Engineering highlights](#engineering-highlights)
+- [Roadmap](#roadmap)
+- [Documentation](#documentation)
+- [Development](#development)
+
+## Why this project exists
+
+LLM agents are increasingly placed in front of real workflows, yet claims about their reliability rarely come with evidence anyone can reproduce. This project asks two concrete questions and builds the machinery to answer them honestly:
+
+1. **How accurately does an agent use tools** on realistic, multi-step government-service workflows: the right tool, with the right arguments, in the right order?
+2. **Does a multi-agent design actually help**, or does it add cost and latency for the same success rate?
+
+Answering either question requires a backend that behaves identically on every run, so that differences in results come from the agent and not from the environment. That is why the backend was built first. The full reasoning is in the [project guide](docs/project-guide.md).
+
+## What is built so far
+
+- **17 MCP tools** for identity verification, parking permits, birth-certificate copies, bulk-waste pickups, address changes, street-issue reports, office appointments, case status, and human escalation.
+- **Deterministic by construction:** a simulated clock, content-derived IDs, and a seeded fixture. The same calls on the same seed produce identical database state.
+- **Safe to retry:** every write tool is idempotent. Repeating a call returns the original record (`created: false`) instead of charging or booking twice.
+- **Server-enforced authorization:** citizen-scoped tools require an HMAC-signed token that only `verify_citizen` can issue, so an agent cannot act for someone it has not verified.
+- **Typed and tested:** `mypy --strict`, `ruff`, more than 200 tests including an end-to-end test against the real server process, and CI on every push.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph clients["Clients"]
+        INS["MCP Inspector"]
+        CC["Claude Code or any MCP client"]
+        AG["LangGraph agent (Phase 2, planned)"]
+        EV["Evaluation harness (Phases 3-4, planned)"]
+    end
+    subgraph server["MCP server: csa-mcp"]
+        TOOLS["17 tools"]
+    end
+    subgraph domain["Domain layer"]
+        SVC["CitizenServices"]
+        POL["Business rules"]
+        STORE["Store"]
+    end
+    DB[("SQLite, seeded fixture")]
+    INS -- stdio --> TOOLS
+    CC -- stdio --> TOOLS
+    AG -. stdio .-> TOOLS
+    EV -. "stdio, fresh DB per task" .-> TOOLS
+    TOOLS --> SVC
+    SVC --> POL
+    SVC --> STORE
+    STORE --> DB
+```
+
+Solid lines exist today; dashed lines are planned. Details are in the [Architecture section of the guide](docs/project-guide.md#4-architecture).
 
 ## Quickstart
 
-Requirements: Python 3.13 and [uv](https://docs.astral.sh/uv/). Docker is not required.
+Requirements: Python 3.13 and [uv](https://docs.astral.sh/uv/). Docker is not needed.
 
 ```bash
-make setup    # create .venv and install runtime + dev dependencies
-make seed     # create var/citizen.db from the bundled fixture (--force)
-make test     # run the full test suite
-make mcp      # start the MCP server on stdio
+git clone https://github.com/lamebrowndev/citizen-service-workflow-agent.git
+cd citizen-service-workflow-agent
+make setup    # create .venv and install dependencies
+make seed     # build var/citizen.db from the bundled fixture
+make check    # format check, lint, strict type check, tests
+make mcp      # run the MCP server on stdio
 ```
 
-Configuration is read from the environment (see `.env.example`):
+## Try it in two minutes
+
+Run `make seed && make inspector`. The MCP Inspector opens in your browser; click **Connect**, open the **Tools** tab, and call these tools in order:
+
+| Step | Tool | Arguments | Result |
+| --- | --- | --- | --- |
+| 1 | `verify_citizen` | `full_name: "Amara Okafor"`, `date_of_birth: "1961-03-02"`, `postal_code: "CV-101"` | `citizen_token: "CTK.CIT-0001.C3D580D6ACEC6E3F"` |
+| 2 | `check_eligibility` | the token, `service_type: "PARKING_PERMIT"` | `eligible: true` |
+| 3 | `quote_fee` | the token, `service_type: "PARKING_PERMIT"` | `quote_id: "QTE-3DA94D2B"`, `amount_cents: 3000` (the senior rate: Amara turns 65 on the simulated date) |
+| 4 | `pay_quote` | the token, `quote_id: "QTE-3DA94D2B"` | `payment_id: "PAY-0ECB7B2E"`, `status: "PAID"` |
+| 5 | `apply_parking_permit` | the token, `license_plate: "CVX1234"`, `payment_id: "PAY-0ECB7B2E"` | `application_id: "APP-8378276D"`, `status: "SUBMITTED"`, `created: true` |
+| 6 | Repeat step 5 | the same arguments | the same `APP-8378276D` with `created: false`: no duplicate |
+
+The backend is deterministic, so you get exactly these values (the token depends on the default development secret). Run `make seed` again to reset the city.
+
+To use the tools from Claude Code instead:
+
+```bash
+claude mcp add civitas -- uv --directory /path/to/citizen-service-workflow-agent run csa-mcp
+```
+
+## The 17 tools
+
+| Tool | Type | Token | Purpose |
+| --- | --- | --- | --- |
+| `verify_citizen` | Read | No | Match name, date of birth, and postal code; return a signed citizen token |
+| `get_citizen_profile` | Read | Yes | Address, zone, vehicles, applications, booked appointments, scheduled pickups |
+| `update_address` | Write | Yes | Change the registered street address and postal code |
+| `get_service_info` | Read | No | Requirements, fee rules, and processing time of a service |
+| `check_eligibility` | Read | Yes | Whether the citizen qualifies for a service, with every reason if not |
+| `quote_fee` | Write | Yes | Create a fee quote for a paid service, or return the open one |
+| `pay_quote` | Write | Yes | Charge the simulated card on file for a quote, exactly once |
+| `apply_parking_permit` | Write | Yes | Submit a parking permit application funded by a payment |
+| `request_birth_certificate` | Write | Yes | Request 1 to 5 certified birth certificate copies funded by a payment |
+| `list_pickup_dates` | Read | Yes | Next four bulk-waste pickup dates for the citizen's zone |
+| `schedule_bulk_pickup` | Write | Yes | Schedule one pickup of up to five items on an offered date |
+| `report_street_issue` | Write | No | Report a pothole, streetlight fault, graffiti, or missed collection |
+| `get_case_status` | Read | For applications | Status of an application or a street issue |
+| `list_appointment_slots` | Read | No | Free 30-minute slots at an office on a date |
+| `book_appointment` | Write | Yes | Book a free slot |
+| `cancel_appointment` | Write | Yes | Cancel a booked appointment and free the slot |
+| `escalate_to_human` | Write | Optional | Hand the request to a human staff member |
+
+Arguments, results, errors, retry behavior, and real examples for each tool: [Tool reference](docs/tool-reference.md).
+
+## Engineering highlights
+
+- **The environment is the ground truth.** The same seed and the same calls produce the same IDs and the same database, which is what will make evaluation scores reproducible.
+- **Idempotency done carefully.** Retries return the original record, and replays match only live records, so a repeat order is a new order while a retried payment is never a second charge.
+- **Authorization lives in the server, not the prompt.** Signed tokens, ownership checks on every lookup, and `NOT_FOUND` for other citizens' records so that existence never leaks.
+- **Errors an agent can act on.** Sixteen stable error codes, such as `NOT_ELIGIBLE` and `SLOT_UNAVAILABLE`, delivered through MCP's `isError` channel.
+- **One transaction per call.** Any failure rolls back, so a failed call leaves no partial state.
+- **Packaging verified in CI.** The pipeline builds the wheel and fails if the fixture or the schema is missing from it.
+
+## Roadmap
+
+| Phase | Deliverable | Status |
+| --- | --- | --- |
+| 1 | Deterministic domain backend and MCP server (17 tools), tests, CI | Done |
+| 2 | Single LangGraph agent using Claude through the Anthropic SDK, connected over MCP; command-line chat | Planned |
+| 3 | Evaluation harness and dataset (30 development tasks, 150 held-out test tasks); metrics report | Planned |
+| 4 | Multi-agent variant and a pre-registered single versus multi-agent comparison | Planned |
+| 5 | FastAPI service with human approval before payments; results write-up | Planned |
+
+## Documentation
+
+- [Project guide](docs/project-guide.md): the problem, motivation, architecture, how every part works, each design decision and its reasons, security, testing, the evaluation plan, FAQ, and glossary.
+- [Tool reference](docs/tool-reference.md): all 17 tools with arguments, results, errors, retry behavior, and examples.
+
+## Development
+
+| Command | What it does |
+| --- | --- |
+| `make setup` | Create `.venv` and install runtime and development dependencies with uv |
+| `make seed` | Rebuild `var/citizen.db` from the bundled fixture |
+| `make mcp` | Run the server on stdio |
+| `make mcp-http` | Run the server on Streamable HTTP at `http://127.0.0.1:8765/mcp` |
+| `make inspector` | Open the MCP Inspector connected to the server |
+| `make fmt` | Format the code with ruff |
+| `make check` | Format check, lint, `mypy --strict`, and tests (what CI runs) |
+
+Configuration comes from environment variables (see `.env.example`):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CSA_DB_PATH` | `var/citizen.db` | SQLite database path, resolved to an absolute path |
 | `CSA_TOKEN_SECRET` | `civitas-dev-secret` | HMAC secret for citizen tokens; a warning is logged when the default is used |
-| `CSA_LOG_LEVEL` | `INFO` | Log level for stderr logging |
-
-The seed CLI also accepts a custom fixture:
-
-```bash
-uv run csa-seed --db var/citizen.db --fixture path/to/fixture.json --force
-```
-
-## Tools
-
-All 17 tools are exposed with identical names and arguments in `CitizenServices` and over MCP.
-
-| Tool | Read/Write | Purpose |
-| --- | --- | --- |
-| `verify_citizen` | Read | Verify name, date of birth, and postal code; return a signed citizen token |
-| `get_citizen_profile` | Read | Return profile, vehicles, applications, booked appointments, and scheduled pickups |
-| `update_address` | Write | Change the citizen's street address and postal code |
-| `get_service_info` | Read | Return a service's description, requirements, fee rules, and processing days |
-| `check_eligibility` | Read | Return whether a citizen is eligible and every applicable reason code |
-| `quote_fee` | Write | Create or replay a fee quote for a paid service |
-| `pay_quote` | Write | Simulate charging the card on file for a quote and record the payment |
-| `apply_parking_permit` | Write | Submit a parking permit application against a paid quote |
-| `request_birth_certificate` | Write | Request 1–5 certified birth certificate copies against a paid quote |
-| `list_pickup_dates` | Read | List the next four bulk-waste pickup dates for the citizen's zone |
-| `schedule_bulk_pickup` | Write | Schedule one bulk-waste pickup on an offered date |
-| `report_street_issue` | Write | Report a pothole, streetlight, graffiti, or missed collection |
-| `get_case_status` | Read | Look up an application or public street issue by case ID |
-| `list_appointment_slots` | Read | List free 30-minute appointment slots at an office on a date |
-| `book_appointment` | Write | Book a free office appointment slot |
-| `cancel_appointment` | Write | Cancel a booked appointment and free its slot |
-| `escalate_to_human` | Write | Create a human-handoff escalation, optionally tied to a citizen |
-
-## Connect an MCP client
-
-The bundled inspector is the quickest way to explore the tools:
-
-```bash
-make seed
-make inspector
-```
-
-To register the server with Claude Code:
-
-```bash
-claude mcp add civitas -- uv --directory <repo-path> run csa-mcp
-```
-
-The server uses stdio by default. For streamable HTTP:
-
-```bash
-make mcp-http            # uv run csa-mcp --transport streamable-http
-```
-
-## Design notes
-
-- **Signed citizen tokens.** `verify_citizen` returns `CTK.<citizen_id>.<signature>`, where the
-  signature is an HMAC-SHA256 prefix over the citizen ID. Token verification is constant-time and
-  never relies on unauthenticated lookups. Only verification returns a token; there is no way to
-  enumerate identities from an ID.
-- **Deterministic, idempotent IDs.** Record IDs are hashes of normalized key content, so retrying
-  the same request addresses the same row. Replays return the stored result with `created=false`
-  (or `changed=false`) and do not write again. Inserts never overwrite an existing primary key.
-  Replays match only live records (open quotes, scheduled pickups, booked appointments), so retries
-  are safe and repeat orders create new records.
-- **Simulated clock.** Domain code never reads the wall clock. "Today" is the `meta.today` value
-  in the database (2026-03-02 in the bundled fixture), which makes quotes, applications, pickups,
-  issues, and escalations reproducible.
-- **Structured error codes.** Domain failures raise `DomainError` with a stable code
-  (`INVALID_TOKEN`, `NOT_ELIGIBLE`, `SLOT_UNAVAILABLE`, and so on) and a short message that never
-  contains another citizen's data. Over MCP these become `isError=true` results whose text begins
-  with the code.
-- **Single-transaction writes.** Each service call opens its own SQLite connection and runs one
-  transaction (`BEGIN IMMEDIATE` for writes). A domain error rolls back, leaving the database
-  unchanged.
-
-## Development
-
-```bash
-make fmt         # format
-make lint        # ruff
-make typecheck   # mypy --strict
-make check       # format check + lint + typecheck + tests
-```
-
-The project targets Python 3.13 and uses only `mcp` and `pydantic` at runtime, with `pytest`,
-`pytest-asyncio`, `ruff`, and `mypy` for development.
+| `CSA_LOG_LEVEL` | `INFO` | Log level; logs go to stderr only |
 
 ## License
 
